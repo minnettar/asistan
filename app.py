@@ -1,10 +1,12 @@
-# app.py — Alina (OpenAI-only) | Reminders + Notes + Google Sheets log | Model env'den
+# app.py — Alina (OpenAI-only) | Reminders + Notes + Google Sheets log | Safe JobQueue | Default: gpt-5
 import os, re, json, base64, sqlite3, logging, pytz
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 from telegram import Update
-from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, ContextTypes, filters
+from telegram.ext import (
+    ApplicationBuilder, CommandHandler, MessageHandler, ContextTypes, filters, JobQueue
+)
 
 from dateparser.search import search_dates
 import gspread
@@ -20,9 +22,9 @@ log = logging.getLogger("alina")
 # ---------- ENV ----------
 BOT_TOKEN        = os.getenv("TELEGRAM_TOKEN", "").strip()
 OPENAI_API_KEY   = os.getenv("OPENAI_API_KEY", "").strip()
-OPENAI_MODEL     = os.getenv("OPENAI_MODEL", "gpt-4o").strip()  # Örn: gpt-5, gpt-4.1, gpt-4o
-GSHEET_ID        = os.getenv("GSHEET_ID", "").strip()            # Spreadsheet ID
-SA_JSON_B64      = os.getenv("GOOGLE_SA_JSON_B64", "").strip()   # service-account.json (base64)
+OPENAI_MODEL     = os.getenv("OPENAI_MODEL", "gpt-5").strip()       # varsayılan: gpt-5
+GSHEET_ID        = os.getenv("GSHEET_ID", "").strip()               # Spreadsheet ID
+SA_JSON_B64      = os.getenv("GOOGLE_SA_JSON_B64", "").strip()      # service-account.json (base64)
 TZ_NAME          = os.getenv("TZ", "Europe/Istanbul")
 local_tz         = pytz.timezone(TZ_NAME)
 
@@ -36,7 +38,7 @@ def ai_reply(prompt: str) -> str:
         return "AI yapılandırılmadı (OPENAI_API_KEY ekleyin)."
     sys_msg = "Adın Alina Çelikkalkan. Türkçe, net ve yardımsever cevap ver."
     resp = openai_client.chat.completions.create(
-        model=OPENAI_MODEL,   # Model env'den gelir (gpt-5, gpt-4.1, gpt-4o, vb.)
+        model=OPENAI_MODEL,   # env'den gelir; default gpt-5
         messages=[{"role":"system","content":sys_msg},
                   {"role":"user","content":prompt}],
         temperature=0.6,
@@ -177,8 +179,9 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         con.execute("INSERT INTO reminders(chat_id,title,remind_at_utc,sent) VALUES (?,?,?,0)",
                     (chat_id, title, when_utc.isoformat()))
         con.commit(); con.close()
-        # JobQueue
-        context.job_queue.run_once(reminder_job, when=when_utc, data={"chat_id":chat_id, "title":title})
+        # JobQueue (güvenli)
+        jobq = context.job_queue or context.application.job_queue
+        jobq.run_once(reminder_job, when=when_utc, data={"chat_id": chat_id, "title": title})
         local_str = when_utc.astimezone(local_tz).strftime("%d.%m.%Y %H:%M")
         try: gs_append(when_utc.astimezone(local_tz), "Hatırlatma (Planlandı)", title, chat_id)
         except Exception as e: log.warning(f"Sheets reminder plan error: {e}")
@@ -228,10 +231,22 @@ def main():
         raise SystemExit("TELEGRAM_TOKEN eksik (Railway Variables'a ekleyin).")
     db_init()
     app = ApplicationBuilder().token(BOT_TOKEN).build()
+
+    # Güvenli JobQueue başlatma (PTB 21.x)
+    jq = app.job_queue
+    if jq is None:
+        jq = JobQueue()
+        jq.set_application(app)
+        jq.start()
+        app.job_queue = jq
+
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("not",   cmd_not))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
+
+    # periyodik süpürücü (kaçan hatırlatmalar)
     app.job_queue.run_repeating(sweeper, interval=20, first=10)
+
     app.run_polling(close_loop=False)
 
 if __name__ == "__main__":
