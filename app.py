@@ -7,35 +7,14 @@ from typing import Optional
 
 from telegram import Update
 from telegram.ext import (
-    ApplicationBuilder, CommandHandler, MessageHandler, ContextTypes, filters, JobQueue
+    ApplicationBuilder, CommandHandler, MessageHandler,
+    ContextTypes, filters, JobQueue
 )
 
 from dateparser.search import search_dates
 import gspread
 from google.oauth2.service_account import Credentials
 from openai import OpenAI  # openai>=1.40,<2
-import openai
-from openai import OpenAI
-client = OpenAI()
-
-try:
-  #Make your OpenAI API request here
-  response = client.chat.completions.create(
-    prompt="Hello world",
-    model="gpt-4o-mini"
-  )
-except openai.APIError as e:
-  #Handle API error here, e.g. retry or log
-  print(f"OpenAI API returned an API Error: {e}")
-  pass
-except openai.APIConnectionError as e:
-  #Handle connection error here
-  print(f"Failed to connect to OpenAI API: {e}")
-  pass
-except openai.RateLimitError as e:
-  #Handle rate limit error (we recommend using exponential backoff)
-  print(f"OpenAI API request exceeded rate limit: {e}")
-  pass
 
 # ---------- LOG ----------
 logging.basicConfig(
@@ -46,9 +25,9 @@ log = logging.getLogger("alina")
 # ---------- ENV ----------
 BOT_TOKEN        = os.getenv("TELEGRAM_TOKEN", "").strip()
 OPENAI_API_KEY   = os.getenv("OPENAI_API_KEY", "").strip()
-OPENAI_MODEL     = os.getenv("OPENAI_MODEL", "gpt-5").strip()       # varsayılan: gpt-5
-GSHEET_ID        = os.getenv("GSHEET_ID", "").strip()               # Spreadsheet ID
-SA_JSON_B64      = os.getenv("GOOGLE_SA_JSON_B64", "").strip()      # service-account.json (base64)
+OPENAI_MODEL     = os.getenv("OPENAI_MODEL", "gpt-5").strip()      # varsayılan gpt-5
+GSHEET_ID        = os.getenv("GSHEET_ID", "").strip()              # Spreadsheet ID
+SA_JSON_B64      = os.getenv("GOOGLE_SA_JSON_B64", "").strip()     # service-account.json (base64)
 TZ_NAME          = os.getenv("TZ", "Europe/Istanbul")
 local_tz         = pytz.timezone(TZ_NAME)
 
@@ -58,7 +37,7 @@ if not OPENAI_API_KEY:
 openai_client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
 
 def ai_reply(prompt: str) -> str:
-    """GPT-5 kurallarına uygun (temperature yok, max_completion_tokens var)."""
+    """GPT-5 kuralları: temperature yok, max_completion_tokens var."""
     if not openai_client:
         return "AI yapılandırılmadı (OPENAI_API_KEY ekleyin)."
     sys_msg = "Adın Alina Çelikkalkan. Türkçe, net ve yardımsever cevap ver."
@@ -68,7 +47,6 @@ def ai_reply(prompt: str) -> str:
             {"role": "system", "content": sys_msg},
             {"role": "user",   "content": prompt}
         ],
-        # temperature parametresi GPT-5'te desteklenmiyor
         max_completion_tokens=1024
     )
     return resp.choices[0].message.content.strip()
@@ -107,7 +85,8 @@ def _gs_client():
 
 def gs_append(row_date_local: datetime, row_type: str, content: str, chat_id: int):
     gc = _gs_client()
-    if not gc: return
+    if not gc:
+        return
     sh = gc.open_by_key(GSHEET_ID)
     tab = row_date_local.strftime("%Y-%m-%d")  # her güne ayrı sheet
     try:
@@ -165,7 +144,7 @@ def split_title_time(text: str):
         when_text = text
     return title, when_text
 
-# ---------- Telegram ----------
+# ---------- Handlers ----------
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "Merhaba, ben Alina 🤖\n"
@@ -187,8 +166,10 @@ async def cmd_not(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 (chat_id, text, ts_utc.isoformat()))
     con.commit(); con.close()
     ts_local = ts_utc.astimezone(local_tz)
-    try: gs_append(ts_local, "Not", text, chat_id)
-    except Exception as e: log.warning(f"Sheets note error: {e}")
+    try:
+        gs_append(ts_local, "Not", text, chat_id)
+    except Exception as e:
+        log.warning(f"Sheets note error: {e}")
     await update.message.reply_text(f"Not alındı ✅ ({ts_local.strftime('%d.%m.%Y %H:%M')}).")
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -210,8 +191,10 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         jobq = context.job_queue or context.application.job_queue
         jobq.run_once(reminder_job, when=when_utc, data={"chat_id": chat_id, "title": title})
         local_str = when_utc.astimezone(local_tz).strftime("%d.%m.%Y %H:%M")
-        try: gs_append(when_utc.astimezone(local_tz), "Hatırlatma (Planlandı)", title, chat_id)
-        except Exception as e: log.warning(f"Sheets reminder plan error: {e}")
+        try:
+            gs_append(when_utc.astimezone(local_tz), "Hatırlatma (Planlandı)", title, chat_id)
+        except Exception as e:
+            log.warning(f"Sheets reminder plan error: {e}")
         return await update.message.reply_text(f"Tamam! {local_str} için hatırlatma kuruldu: “{title}”")
 
     # Normal sohbet → OpenAI (GPT-5)
@@ -233,8 +216,10 @@ async def reminder_job(context: ContextTypes.DEFAULT_TYPE):
         (chat_id, title)
     )
     con.commit(); con.close()
-    try: gs_append(datetime.now(local_tz), "Hatırlatma (Gönderildi)", title, chat_id)
-    except Exception as e: log.warning(f"Sheets reminder send error: {e}")
+    try:
+        gs_append(datetime.now(local_tz), "Hatırlatma (Gönderildi)", title, chat_id)
+    except Exception as e:
+        log.warning(f"Sheets reminder send error: {e}")
 
 async def sweeper(context: ContextTypes.DEFAULT_TYPE):
     """Kaçan hatırlatmaları yakala (worker yeniden başlarsa)."""
@@ -247,9 +232,19 @@ async def sweeper(context: ContextTypes.DEFAULT_TYPE):
     for _id, chat_id, title, ts in rows:
         await context.bot.send_message(chat_id=chat_id, text=f"⏰ (Geç) Hatırlatma: {title}")
         con.execute("UPDATE reminders SET sent=1 WHERE id=?", (_id,))
-        try: gs_append(datetime.now(local_tz), "Hatırlatma (Geç yakalandı)", title, chat_id)
-        except Exception as e: log.warning(f"Sheets late log error: {e}")
+        try:
+            gs_append(datetime.now(local_tz), "Hatırlatma (Geç yakalandı)", title, chat_id)
+        except Exception as e:
+            log.warning(f"Sheets late log error: {e}")
     con.commit(); con.close()
+
+# (opsiyonel) basit error handler
+async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    from telegram.error import Conflict
+    if isinstance(context.error, Conflict):
+        log.warning("Another polling instance detected; ignoring Conflict.")
+        return
+    log.exception(context.error)
 
 # ---------- MAIN ----------
 def main():
@@ -269,6 +264,7 @@ def main():
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("not",   cmd_not))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
+    app.add_error_handler(on_error)
 
     # periyodik süpürücü (kaçan hatırlatmalar)
     app.job_queue.run_repeating(sweeper, interval=20, first=10)
