@@ -1,5 +1,5 @@
 # app.py — Alina (OpenAI-only) | Reminders + Notes + Google Sheets log
-# GPT-5 uyumlu: temperature YOK, max_completion_tokens VAR | Safe JobQueue init
+# GPT-5 uyumlu: temperature YOK, max_completion_tokens VAR | Safe JobQueue + boş mesaj korumaları
 
 import os, re, json, base64, sqlite3, logging, pytz
 from datetime import datetime, timedelta, timezone
@@ -37,19 +37,25 @@ if not OPENAI_API_KEY:
 openai_client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
 
 def ai_reply(prompt: str) -> str:
-    """GPT-5 kuralları: temperature yok, max_completion_tokens var."""
+    """GPT-5 kuralları: temperature yok, max_completion_tokens var. Boş cevap asla dönmez."""
     if not openai_client:
         return "AI yapılandırılmadı (OPENAI_API_KEY ekleyin)."
     sys_msg = "Adın Alina Çelikkalkan. Türkçe, net ve yardımsever cevap ver."
-    resp = openai_client.chat.completions.create(
-        model=OPENAI_MODEL,
-        messages=[
-            {"role": "system", "content": sys_msg},
-            {"role": "user",   "content": prompt}
-        ],
-        max_completion_tokens=1024
-    )
-    return resp.choices[0].message.content.strip()
+    try:
+        resp = openai_client.chat.completions.create(
+            model=OPENAI_MODEL,
+            messages=[
+                {"role": "system", "content": sys_msg},
+                {"role": "user",   "content": prompt}
+            ],
+            max_completion_tokens=1024
+        )
+        content = (resp.choices[0].message.content or "").strip()
+        if not content:
+            return "Üzgünüm, şu an cevap üretemedim."
+        return content[:4096]  # Telegram 4096 karakter limiti
+    except Exception as e:
+        return f"Şu anda yanıt veremiyorum. (Hata: {e})"
 
 # ---------- DB ----------
 DB = "data.db"
@@ -173,43 +179,48 @@ async def cmd_not(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"Not alındı ✅ ({ts_local.strftime('%d.%m.%Y %H:%M')}).")
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    txt     = (update.message.text or "").strip()
+    txt = (update.message.text or "").strip()
+    if not txt:
+        return  # boş mesaj gelirse hiçbir şey gönderme
+
     chat_id = update.effective_chat.id
 
     # Hatırlatma
     if REMIND_RE.search(txt):
         title, when_text = split_title_time(txt)
+        title = (title or "").strip() or "Hatırlatma"
+
         when_utc = parse_when(when_text)
         if not when_utc:
             return await update.message.reply_text("Zamanı anlayamadım. Örn: “hatırlat su iç | yarın 10:30”.")
-        # DB
+
         con = sqlite3.connect(DB)
         con.execute("INSERT INTO reminders(chat_id,title,remind_at_utc,sent) VALUES (?,?,?,0)",
                     (chat_id, title, when_utc.isoformat()))
         con.commit(); con.close()
-        # JobQueue (güvenli)
+
         jobq = context.job_queue or context.application.job_queue
         jobq.run_once(reminder_job, when=when_utc, data={"chat_id": chat_id, "title": title})
+
         local_str = when_utc.astimezone(local_tz).strftime("%d.%m.%Y %H:%M")
         try:
             gs_append(when_utc.astimezone(local_tz), "Hatırlatma (Planlandı)", title, chat_id)
         except Exception as e:
             log.warning(f"Sheets reminder plan error: {e}")
+
         return await update.message.reply_text(f"Tamam! {local_str} için hatırlatma kuruldu: “{title}”")
 
     # Normal sohbet → OpenAI (GPT-5)
-    try:
-        reply = ai_reply(txt)
-    except Exception as e:
-        reply = f"Şu anda yanıt veremiyorum. (Hata: {e})"
-    await update.message.reply_text(reply)
+    reply = ai_reply(txt)
+    await update.message.reply_text(reply or "Üzgünüm, şu an cevap üretemedim.")
 
 async def reminder_job(context: ContextTypes.DEFAULT_TYPE):
     d = context.job.data or {}
     chat_id = int(d.get("chat_id"))
-    title   = d.get("title", "Hatırlatma")
+    title   = (d.get("title") or "").strip() or "Hatırlatma"
+
     await context.bot.send_message(chat_id=chat_id, text=f"⏰ Hatırlatma: {title}")
-    # DB işaretle + Sheets log
+
     con = sqlite3.connect(DB)
     con.execute(
         "UPDATE reminders SET sent=1 WHERE rowid = (SELECT rowid FROM reminders WHERE chat_id=? AND title=? ORDER BY rowid DESC LIMIT 1)",
