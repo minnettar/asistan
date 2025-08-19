@@ -1,4 +1,4 @@
-# app.py — Alina (OpenAI-only) | Reminders + Notes + Google Sheets log
+# app.py — Alina (OpenAI-only) | Reminders + Notes + Google Sheets log | Model env'den
 import os, re, json, base64, sqlite3, logging, pytz
 from datetime import datetime, timedelta, timezone
 from typing import Optional
@@ -6,12 +6,9 @@ from typing import Optional
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, ContextTypes, filters
 
-import dateparser
 from dateparser.search import search_dates
-
 import gspread
 from google.oauth2.service_account import Credentials
-
 from openai import OpenAI  # openai>=1.40,<2
 
 # ---------- LOG ----------
@@ -23,8 +20,9 @@ log = logging.getLogger("alina")
 # ---------- ENV ----------
 BOT_TOKEN        = os.getenv("TELEGRAM_TOKEN", "").strip()
 OPENAI_API_KEY   = os.getenv("OPENAI_API_KEY", "").strip()
-GSHEET_ID        = os.getenv("GSHEET_ID", "").strip()              # spreadsheet ID
-SA_JSON_B64      = os.getenv("GOOGLE_SA_JSON_B64", "").strip()     # service-account.json (base64)
+OPENAI_MODEL     = os.getenv("OPENAI_MODEL", "gpt-4o").strip()  # Örn: gpt-5, gpt-4.1, gpt-4o
+GSHEET_ID        = os.getenv("GSHEET_ID", "").strip()            # Spreadsheet ID
+SA_JSON_B64      = os.getenv("GOOGLE_SA_JSON_B64", "").strip()   # service-account.json (base64)
 TZ_NAME          = os.getenv("TZ", "Europe/Istanbul")
 local_tz         = pytz.timezone(TZ_NAME)
 
@@ -38,7 +36,7 @@ def ai_reply(prompt: str) -> str:
         return "AI yapılandırılmadı (OPENAI_API_KEY ekleyin)."
     sys_msg = "Adın Alina Çelikkalkan. Türkçe, net ve yardımsever cevap ver."
     resp = openai_client.chat.completions.create(
-        model="gpt-4o-mini",  # isterseniz 'gpt-4o'
+        model=OPENAI_MODEL,   # Model env'den gelir (gpt-5, gpt-4.1, gpt-4o, vb.)
         messages=[{"role":"system","content":sys_msg},
                   {"role":"user","content":prompt}],
         temperature=0.6,
@@ -146,7 +144,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• hatırlat yarın 15:00 su iç\n"
         "• hatırlat ilaç al | bugün 21:30\n"
         "• /not Toplantı özetini hazırla\n"
-        "Model: OpenAI"
+        f"Model: {OPENAI_MODEL}"
     )
 
 async def cmd_not(update: Update, context: ContextTypes.DEFAULT_TYPE):
