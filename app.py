@@ -1,9 +1,10 @@
 # app.py — Alina (OpenAI-only) | Reminders + Notes + Google Sheets log
-# GPT-5 uyumlu: temperature YOK, max_completion_tokens VAR | Safe JobQueue + boş mesaj korumaları
+# GPT-5 uyumlu (temperature yok, max_completion_tokens var) | Safe JobQueue
+# Esnek niyet algılama: yerel regex + GPT-5 JSON çıkarım fallback
 
 import os, re, json, base64, sqlite3, logging, pytz
 from datetime import datetime, timedelta, timezone
-from typing import Optional
+from typing import Optional, Tuple
 
 from telegram import Update
 from telegram.ext import (
@@ -37,7 +38,7 @@ if not OPENAI_API_KEY:
 openai_client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
 
 def ai_reply(prompt: str) -> str:
-    """GPT-5 kuralları: temperature yok, max_completion_tokens var. Boş cevap asla dönmez."""
+    """GPT-5: temperature yok, max_completion_tokens var. Boş cevap asla dönmesin."""
     if not openai_client:
         return "AI yapılandırılmadı (OPENAI_API_KEY ekleyin)."
     sys_msg = "Adın Alina Çelikkalkan. Türkçe, net ve yardımsever cevap ver."
@@ -53,9 +54,62 @@ def ai_reply(prompt: str) -> str:
         content = (resp.choices[0].message.content or "").strip()
         if not content:
             return "Üzgünüm, şu an cevap üretemedim."
-        return content[:4096]  # Telegram 4096 karakter limiti
+        return content[:4096]
     except Exception as e:
         return f"Şu anda yanıt veremiyorum. (Hata: {e})"
+
+def ai_intent(text: str) -> Optional[dict]:
+    """
+    Kararsız durumda GPT-5'ten yapılandırılmış niyet çıkarımı ister.
+    Beklenen JSON şeması:
+      {
+        "intent": "note" | "reminder" | "chat",
+        "title": "<metin veya boş>",
+        "when_text": "<doğal zaman ifadesi veya boş>"
+      }
+    """
+    if not openai_client:
+        return None
+    sys_msg = (
+        "Türkçe niyet sınıflandırıcı ve bilgi çıkarıcı gibi davran.\n"
+        "Girdi: kullanıcı mesajı.\n"
+        "Çıktı: Sadece GEÇERLİ JSON döndür (ekstra metin YOK).\n"
+        "Alanlar:\n"
+        "- intent: 'note' (not alma), 'reminder' (hatırlatma) veya 'chat' (sohbet)\n"
+        "- title: not ya da hatırlatma başlığı (yoksa boş string)\n"
+        "- when_text: hatırlatma zamanı doğal dil (yoksa boş string)\n"
+        "Kurallar:\n"
+        "- 'not al', 'not alır mısın', 'yazar mısın' vb. -> note\n"
+        "- 'hatırlat', 'hatırlatır mısın', 'alarm kur', 'bana ... hatırlat' vb. -> reminder\n"
+        "- Zaman ifadesi barizse when_text'e yaz (örn: 'yarın 10:30', '2 dakika sonra').\n"
+        "- JSON dışında hiçbir şey yazma."
+    )
+    user_msg = f"Mesaj: {text}"
+    try:
+        resp = openai_client.chat.completions.create(
+            model=OPENAI_MODEL,
+            messages=[
+                {"role": "system", "content": sys_msg},
+                {"role": "user",   "content": user_msg}
+            ],
+            max_completion_tokens=300
+        )
+        raw = (resp.choices[0].message.content or "").strip()
+        # JSON güvenliği
+        start = raw.find("{")
+        end   = raw.rfind("}")
+        if start == -1 or end == -1:
+            return None
+        data = json.loads(raw[start:end+1])
+        intent = (data.get("intent") or "").strip().lower()
+        if intent not in {"note", "reminder", "chat"}:
+            return None
+        data["title"]     = (data.get("title") or "").strip()
+        data["when_text"] = (data.get("when_text") or "").strip()
+        return data
+    except Exception as e:
+        log.warning(f"ai_intent error: {e}")
+        return None
 
 # ---------- DB ----------
 DB = "data.db"
@@ -109,7 +163,14 @@ def gs_append(row_date_local: datetime, row_type: str, content: str, chat_id: in
     ])
 
 # ---------- Zaman/Metin ----------
-REMIND_RE = re.compile(r"\b(hatırlat|hatirlat|remind)\b", re.IGNORECASE)
+REMIND_RE = re.compile(
+    r"\b(hat[ıi]rlat(?:[ıi]r m[ıi]s[ıi]n)?|alarm kur|bana .* hat[ıi]rlat|remind)\b",
+    re.IGNORECASE
+)
+NOTE_RE = re.compile(
+    r"\b(not ?al(?:[ıi]r m[ıi]s[ıi]n)?|yaz(ar m[ıi]s[ıi]n)?|kaydet)\b",
+    re.IGNORECASE
+)
 
 def normalize_time_text(s: str) -> str:
     s = s.lower()
@@ -140,7 +201,7 @@ def parse_when(text: str) -> Optional[datetime]:
         return dt_local.astimezone(timezone.utc)
     return None
 
-def split_title_time(text: str):
+def split_title_time(text: str) -> Tuple[str, str]:
     if "|" in text:
         left, right = text.split("|", 1)
         title = REMIND_RE.sub("", left).strip() or left.strip()
@@ -155,9 +216,9 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "Merhaba, ben Alina 🤖\n"
         "Örnekler:\n"
-        "• hatırlat yarın 15:00 su iç\n"
+        "• not al Toplantı özetini yaz\n"
         "• hatırlat ilaç al | bugün 21:30\n"
-        "• /not Toplantı özetini hazırla\n"
+        "• yarın 10:30 su iç  (anahtar kelime olmasa da denerim)\n"
         f"Model: {OPENAI_MODEL}"
     )
 
@@ -181,36 +242,83 @@ async def cmd_not(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     txt = (update.message.text or "").strip()
     if not txt:
-        return  # boş mesaj gelirse hiçbir şey gönderme
+        return
 
     chat_id = update.effective_chat.id
 
-    # Hatırlatma
+    # 1) Yerel hızlı niyet: NOT
+    if NOTE_RE.search(txt):
+        note_text = NOTE_RE.sub("", txt).strip() or txt
+        ts_utc = datetime.now(timezone.utc)
+        con = sqlite3.connect(DB)
+        con.execute("INSERT INTO notes(chat_id,text,created_utc) VALUES (?,?,?)",
+                    (chat_id, note_text, ts_utc.isoformat()))
+        con.commit(); con.close()
+        ts_local = ts_utc.astimezone(local_tz)
+        try:
+            gs_append(ts_local, "Not", note_text, chat_id)
+        except Exception as e:
+            log.warning(f"Sheets note error: {e}")
+        return await update.message.reply_text(f"Not alındı ✅ ({ts_local.strftime('%d.%m.%Y %H:%M')}).")
+
+    # 2) Yerel hızlı niyet: HATIRLATMA
     if REMIND_RE.search(txt):
         title, when_text = split_title_time(txt)
         title = (title or "").strip() or "Hatırlatma"
-
         when_utc = parse_when(when_text)
         if not when_utc:
             return await update.message.reply_text("Zamanı anlayamadım. Örn: “hatırlat su iç | yarın 10:30”.")
-
         con = sqlite3.connect(DB)
         con.execute("INSERT INTO reminders(chat_id,title,remind_at_utc,sent) VALUES (?,?,?,0)",
                     (chat_id, title, when_utc.isoformat()))
         con.commit(); con.close()
-
         jobq = context.job_queue or context.application.job_queue
         jobq.run_once(reminder_job, when=when_utc, data={"chat_id": chat_id, "title": title})
-
         local_str = when_utc.astimezone(local_tz).strftime("%d.%m.%Y %H:%M")
         try:
             gs_append(when_utc.astimezone(local_tz), "Hatırlatma (Planlandı)", title, chat_id)
         except Exception as e:
             log.warning(f"Sheets reminder plan error: {e}")
-
         return await update.message.reply_text(f"Tamam! {local_str} için hatırlatma kuruldu: “{title}”")
 
-    # Normal sohbet → OpenAI (GPT-5)
+    # 3) AI fallback niyet çıkarımı (esneklik)
+    parsed = ai_intent(txt)
+    if parsed:
+        intent = parsed["intent"]
+        if intent == "note":
+            note_text = parsed["title"] or txt
+            ts_utc = datetime.now(timezone.utc)
+            con = sqlite3.connect(DB)
+            con.execute("INSERT INTO notes(chat_id,text,created_utc) VALUES (?,?,?)",
+                        (chat_id, note_text, ts_utc.isoformat()))
+            con.commit(); con.close()
+            ts_local = ts_utc.astimezone(local_tz)
+            try:
+                gs_append(ts_local, "Not", note_text, chat_id)
+            except Exception as e:
+                log.warning(f"Sheets note error: {e}")
+            return await update.message.reply_text(f"Not alındı ✅ ({ts_local.strftime('%d.%m.%Y %H:%M')}).")
+
+        if intent == "reminder":
+            title = (parsed["title"] or "Hatırlatma").strip()
+            when_text = parsed["when_text"] or txt
+            when_utc  = parse_when(when_text)
+            if not when_utc:
+                return await update.message.reply_text("Zamanı anlayamadım. Örn: “hatırlat su iç | yarın 10:30”.")
+            con = sqlite3.connect(DB)
+            con.execute("INSERT INTO reminders(chat_id,title,remind_at_utc,sent) VALUES (?,?,?,0)",
+                        (chat_id, title, when_utc.isoformat()))
+            con.commit(); con.close()
+            jobq = context.job_queue or context.application.job_queue
+            jobq.run_once(reminder_job, when=when_utc, data={"chat_id": chat_id, "title": title})
+            local_str = when_utc.astimezone(local_tz).strftime("%d.%m.%Y %H:%M")
+            try:
+                gs_append(when_utc.astimezone(local_tz), "Hatırlatma (Planlandı)", title, chat_id)
+            except Exception as e:
+                log.warning(f"Sheets reminder plan error: {e}")
+            return await update.message.reply_text(f"Tamam! {local_str} için hatırlatma kuruldu: “{title}”")
+
+    # 4) Aksi halde normal sohbet → GPT-5
     reply = ai_reply(txt)
     await update.message.reply_text(reply or "Üzgünüm, şu an cevap üretemedim.")
 
