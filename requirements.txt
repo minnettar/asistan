@@ -1,3 +1,6 @@
-python-telegram-bot==20.8
-groq
-streamlit
+python-telegram-bot==21.6
+openai>=1.40,<2
+dateparser
+pytz
+gspread
+google-auth
