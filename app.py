@@ -1,4 +1,6 @@
-# app.py — Alina (OpenAI-only) | Reminders + Notes + Google Sheets log | Safe JobQueue | Default: gpt-5
+# app.py — Alina (OpenAI-only) | Reminders + Notes + Google Sheets log
+# GPT-5 uyumlu: temperature YOK, max_completion_tokens VAR | Safe JobQueue init
+
 import os, re, json, base64, sqlite3, logging, pytz
 from datetime import datetime, timedelta, timezone
 from typing import Optional
@@ -34,14 +36,17 @@ if not OPENAI_API_KEY:
 openai_client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
 
 def ai_reply(prompt: str) -> str:
+    """GPT-5 kurallarına uygun (temperature yok, max_completion_tokens var)."""
     if not openai_client:
         return "AI yapılandırılmadı (OPENAI_API_KEY ekleyin)."
     sys_msg = "Adın Alina Çelikkalkan. Türkçe, net ve yardımsever cevap ver."
     resp = openai_client.chat.completions.create(
-        model=OPENAI_MODEL,   # env'den gelir; default gpt-5
-        messages=[{"role":"system","content":sys_msg},
-                  {"role":"user","content":prompt}],
-        temperature=0.6,
+        model=OPENAI_MODEL,
+        messages=[
+            {"role": "system", "content": sys_msg},
+            {"role": "user",   "content": prompt}
+        ],
+        # temperature parametresi GPT-5'te desteklenmiyor
         max_completion_tokens=1024
     )
     return resp.choices[0].message.content.strip()
@@ -187,9 +192,8 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception as e: log.warning(f"Sheets reminder plan error: {e}")
         return await update.message.reply_text(f"Tamam! {local_str} için hatırlatma kuruldu: “{title}”")
 
-    # Normal sohbet → OpenAI
+    # Normal sohbet → OpenAI (GPT-5)
     try:
-        await update.message.chat.send_action("typing")
         reply = ai_reply(txt)
     except Exception as e:
         reply = f"Şu anda yanıt veremiyorum. (Hata: {e})"
