@@ -42,7 +42,7 @@ def ai_reply(prompt: str) -> str:
         messages=[{"role":"system","content":sys_msg},
                   {"role":"user","content":prompt}],
         temperature=0.6,
-        max_tokens=1024
+        max_completion_tokens=1024
     )
     return resp.choices[0].message.content.strip()
 
