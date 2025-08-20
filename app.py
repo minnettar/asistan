@@ -1,12 +1,11 @@
-# app.py — Alina Bot | Notlar + Vade Kontrol
+# app.py — Alina Bot | Notlar + Vade Kontrol (Ödenme Durumu ile)
 
-import os, re, json, base64, logging, pytz, datetime
-from datetime import datetime as dt, timezone
+import os, json, base64, logging, pytz, datetime
+from datetime import datetime as dt
 
 from telegram import Update
 from telegram.ext import (
-    ApplicationBuilder, CommandHandler, MessageHandler,
-    ContextTypes, filters
+    ApplicationBuilder, CommandHandler, ContextTypes
 )
 
 import gspread
@@ -73,22 +72,28 @@ async def vade_kontrol(context: ContextTypes.DEFAULT_TYPE):
     today = dt.now(local_tz).date()
     uyarilar = []
 
-    for i, row in enumerate(rows[1:], start=2):
+    for i, row in enumerate(rows[1:], start=2):  # başlık hariç
         try:
-            vade_raw = row[3]  # D sütunu
+            vade_raw = row[3]   # D sütunu (vade tarihi)
+            odendi   = row[14] if len(row) > 14 else ""  # O sütunu (A=0 → O=14)
             if not vade_raw:
                 continue
-            # Format: YYYY-MM-DD HH:MM:SS
+
+            # Eğer ödenmişse atla
+            if str(odendi).strip().upper() == "TRUE":
+                continue
+
+            # Tarihi parse et
             vade_tarih = dt.strptime(vade_raw.strip(), "%Y-%m-%d %H:%M:%S").date()
             if vade_tarih == today:
                 aciklama = row[0] if len(row) > 0 else f"Satır {i}"
-                uyarilar.append(f"{aciklama} → Vade tarihi bugün ({vade_raw})")
+                uyarilar.append(f"{aciklama} → Vade tarihi bugün ({vade_raw}) | Ödenmedi")
         except Exception as e:
             log.warning(f"Satır {i} hata: {e}")
             continue
 
     if uyarilar:
-        msg = "⏰ Bugün vadesi gelenler:\n" + "\n".join(uyarilar)
+        msg = "⏰ Bugün vadesi gelen ve ödenmemiş satırlar:\n" + "\n".join(uyarilar)
         await context.bot.send_message(chat_id=CHAT_ID, text=msg)
 
 # ---------- Telegram Handlers ----------
@@ -96,7 +101,8 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "Merhaba, ben Alina 🤖\n"
         "• /not <metin> → not ekler (GSHEET_NOTES_ID içine kaydedilir)\n"
-        "• Her gün 09:00’da D sütunundaki vadeleri kontrol ederim (GSHEET_VADE_ID)."
+        "• Her gün 09:00’da GSHEET_VADE_ID tablosunda D sütununu kontrol ederim.\n"
+        "• Eğer O sütununda TRUE ise (ödenmiş), bildirim yapmam."
     )
 
 async def cmd_not(update: Update, context: ContextTypes.DEFAULT_TYPE):
