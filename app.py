@@ -1,18 +1,20 @@
-# app.py — Alina Bot | GPT-5 + Notlar + Vade Kontrol
-import os, json, base64, logging, pytz, datetime as dt_module, re, sqlite3
-from datetime import datetime, timezone
-from pathlib import Path
-from dateparser.search import search_dates
+# app.py — Alina (OpenAI-only) | Reminders + Notes + Google Sheets log
+# GPT-5 uyumlu: temperature YOK, max_completion_tokens VAR | Safe JobQueue + boş mesaj korumaları
+
+import os, re, json, base64, sqlite3, logging, pytz
+from datetime import datetime, timedelta, timezone
+from typing import Optional
 
 from telegram import Update
 from telegram.ext import (
     ApplicationBuilder, CommandHandler, MessageHandler,
-    ContextTypes, filters
+    ContextTypes, filters, JobQueue
 )
 
+from dateparser.search import search_dates
 import gspread
 from google.oauth2.service_account import Credentials
-from openai import AsyncOpenAI
+from openai import OpenAI  # openai>=1.40,<2
 
 # ---------- LOG ----------
 logging.basicConfig(
@@ -21,159 +23,132 @@ logging.basicConfig(
 log = logging.getLogger("alina")
 
 # ---------- ENV ----------
-BOT_TOKEN       = os.getenv("TELEGRAM_TOKEN", "").strip()
-SA_JSON_B64     = os.getenv("GOOGLE_SA_JSON_B64", "").strip()
-GSHEET_NOTES_ID = os.getenv("GSHEET_NOTES_ID", "").strip()
-GSHEET_VADE_ID  = os.getenv("GSHEET_VADE_ID", "").strip()
-CHAT_ID         = int(os.getenv("CHAT_ID", "8396073279"))
-TZ_NAME         = os.getenv("TZ", "Europe/Istanbul")
-local_tz        = pytz.timezone(TZ_NAME)
+BOT_TOKEN        = os.getenv("TELEGRAM_TOKEN", "").strip()
+OPENAI_API_KEY   = os.getenv("OPENAI_API_KEY", "").strip()
+OPENAI_MODEL     = os.getenv("OPENAI_MODEL", "gpt-5").strip()      # varsayılan gpt-5
+GSHEET_ID        = os.getenv("GSHEET_ID", "").strip()              # Spreadsheet ID
+SA_JSON_B64      = os.getenv("GOOGLE_SA_JSON_B64", "").strip()     # service-account.json (base64)
+TZ_NAME          = os.getenv("TZ", "Europe/Istanbul")
+local_tz         = pytz.timezone(TZ_NAME)
 
-DB              = Path(__file__).with_name("data.db")
+# ---------- AI (OpenAI) ----------
+if not OPENAI_API_KEY:
+    log.warning("OPENAI_API_KEY eksik; AI yanıtları çalışmayacak.")
+openai_client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
 
-OPENAI_API_KEY  = os.getenv("OPENAI_API_KEY", "").strip()
-OPENAI_MODEL    = os.getenv("OPENAI_MODEL", "gpt-5").strip()
-openai_client   = AsyncOpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
+def ai_reply(prompt: str) -> str:
+    """GPT-5 kuralları: temperature yok, max_completion_tokens var. Boş cevap asla dönmez."""
+    if not openai_client:
+        return "AI yapılandırılmadı (OPENAI_API_KEY ekleyin)."
+    sys_msg = "Adın Alina Çelikkalkan. Türkçe, net ve yardımsever cevap ver."
+    try:
+        resp = openai_client.chat.completions.create(
+            model=OPENAI_MODEL,
+            messages=[
+                {"role": "system", "content": sys_msg},
+                {"role": "user",   "content": prompt}
+            ],
+            max_completion_tokens=1024
+        )
+        content = (resp.choices[0].message.content or "").strip()
+        if not content:
+            return "Üzgünüm, şu an cevap üretemedim."
+        return content[:4096]  # Telegram 4096 karakter limiti
+    except Exception as e:
+        return f"Şu anda yanıt veremiyorum. (Hata: {e})"
 
 # ---------- DB ----------
-def init_db() -> None:
-    """Create required SQLite tables if they do not yet exist."""
+DB = "data.db"
+def db_init():
     con = sqlite3.connect(DB)
-    try:
-        con.execute(
-            """
-            CREATE TABLE IF NOT EXISTS notes (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                chat_id INTEGER,
-                text TEXT,
-                created_utc TEXT
-            )
-            """
-        )
-        con.execute(
-            """
-            CREATE TABLE IF NOT EXISTS reminders (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                chat_id INTEGER,
-                title TEXT,
-                remind_at_utc TEXT,
-                sent INTEGER DEFAULT 0
-            )
-            """
-        )
-        con.commit()
-    finally:
-        con.close()
-
-
-# Regex to detect reminder commands like "hatırlat" or "/hatirlat"
-REMIND_RE = re.compile(r"^\s*(?:/)?hat[ıi]rlat\b", re.IGNORECASE)
+    con.execute("""CREATE TABLE IF NOT EXISTS reminders(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        chat_id INTEGER NOT NULL,
+        title TEXT NOT NULL,
+        remind_at_utc TEXT NOT NULL,
+        sent INTEGER DEFAULT 0
+    )""")
+    con.execute("""CREATE TABLE IF NOT EXISTS notes(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        chat_id INTEGER NOT NULL,
+        text TEXT NOT NULL,
+        created_utc TEXT NOT NULL
+    )""")
+    con.commit(); con.close()
 
 # ---------- Google Sheets ----------
-def _gs_open(sheet_id: str):
-    if not SA_JSON_B64 or not sheet_id:
+def _gs_client():
+    if not SA_JSON_B64 or not GSHEET_ID:
         return None
     try:
         info = json.loads(base64.b64decode(SA_JSON_B64).decode("utf-8"))
         scopes = ["https://www.googleapis.com/auth/spreadsheets"]
         creds  = Credentials.from_service_account_info(info, scopes=scopes)
-        gc = gspread.authorize(creds)
-        return gc.open_by_key(sheet_id)
+        return gspread.authorize(creds)
     except Exception as e:
         log.warning(f"Sheets auth error: {e}")
         return None
 
-# Use explicit datetime type for clarity
-def gs_append_note(row_date_local: datetime, content: str, chat_id: int):
-    sh = _gs_open(GSHEET_NOTES_ID)
-    if not sh:
+def gs_append(row_date_local: datetime, row_type: str, content: str, chat_id: int):
+    gc = _gs_client()
+    if not gc:
         return
-    tab = row_date_local.strftime("%Y-%m-%d")
+    sh = gc.open_by_key(GSHEET_ID)
+    tab = row_date_local.strftime("%Y-%m-%d")  # her güne ayrı sheet
     try:
         ws = sh.worksheet(tab)
     except gspread.WorksheetNotFound:
         ws = sh.add_worksheet(title=tab, rows=1000, cols=6)
-        ws.append_row(["Tarih","Saat","ChatID","İçerik"])
+        ws.append_row(["Tarih","Saat","ChatID","Tür","İçerik/Durum"])
     ws.append_row([
         row_date_local.strftime("%d.%m.%Y"),
         row_date_local.strftime("%H:%M:%S"),
         str(chat_id),
+        row_type,
         content
     ])
-def gs_append(dt_local: datetime, entry_type: str, content: str, chat_id: int):
-    sh = _gs_open(GSHEET_NOTES_ID)
-    if not sh:
-        return
-    tab = dt_local.strftime("%Y-%m-%d")
-    try:
-        ws = sh.worksheet(tab)
-    except gspread.WorksheetNotFound:
-        ws = sh.add_worksheet(title=tab, rows=1000, cols=6)
-        ws.append_row(["Tarih","Saat","Tür","ChatID","İçerik"])
-    ws.append_row([
-        dt_local.strftime("%d.%m.%Y"),
-        dt_local.strftime("%H:%M:%S"),
-        entry_type,
-        str(chat_id),
-        content
-    ])
-# ---------- GPT-5 ----------
-async def ai_reply(prompt: str) -> str:
-    if not openai_client:
-        return "AI yapılandırılmadı (OPENAI_API_KEY ekleyin)."
-    try:
-        resp = await openai_client.chat.completions.create(
-            model=OPENAI_MODEL,
-            messages=[
-                {
-                    "role": "system",
-                    "content": "Adın Alina. Kullanıcının yazdığı dilde net, yardımsever ve kısa cevap ver."
-                },
-                {"role": "user", "content": prompt}
-            ],
-            max_completion_tokens=1024
-        )
-        content = (resp.choices[0].message.content or "").strip()
-        return content if content else "Üzgünüm, şu an cevap üretemedim."
-    except Exception as e:
-        return f"Şu anda yanıt veremiyorum. (Hata: {e})"
 
-# ---------- Vade Kontrol ----------
-async def vade_kontrol(context: ContextTypes.DEFAULT_TYPE):
-    sh = _gs_open(GSHEET_VADE_ID)
-    if not sh:
-        return
-    try:
-        ws = sh.sheet1
-        rows = ws.get_all_values()
-    except Exception as e:
-        log.warning(f"Sheets read error: {e}")
-        return
-        
-    today = datetime.now(local_tz).date()
-    uyarilar = []
+# ---------- Zaman/Metin ----------
+REMIND_RE = re.compile(r"\b(hatırlat|hatirlat|remind)\b", re.IGNORECASE)
 
-    for i, row in enumerate(rows[1:], start=2):
-        try:
-            vade_raw = row[3]   # D sütunu (A=0, B=1, C=2, D=3)
-            odendi   = row[14] if len(row) > 14 else ""  # O sütunu (A=0 → O=14)
-            if not vade_raw:
-                continue
+def normalize_time_text(s: str) -> str:
+    s = s.lower()
+    s = re.sub(r'(\d{1,2})\.(\d{2})', r'\1:\2', s)   # 21.15 -> 21:15
+    s = re.sub(r'\b(saat)\b', ' ', s)
+    s = re.sub(r'\b(ta|te|da|de)\b', ' ', s)
+    return s
 
-            if str(odendi).strip().upper() == "TRUE":
-                continue
+def parse_when(text: str) -> Optional[datetime]:
+    raw = normalize_time_text(text)
+    found = search_dates(
+        raw, languages=['tr','en'],
+        settings={
+            'TIMEZONE': TZ_NAME,
+            'RETURN_AS_TIMEZONE_AWARE': True,
+            'PREFER_DATES_FROM': 'future'
+        }
+    )
+    if found:
+        return found[-1][1].astimezone(timezone.utc)
+    m = re.search(r'(\d{1,2}):(\d{2})', raw)
+    if m:
+        h, mi = int(m.group(1)), int(m.group(2))
+        now_local = datetime.now(local_tz)
+        dt_local  = now_local.replace(hour=h, minute=mi, second=0, microsecond=0)
+        if dt_local <= now_local:
+            dt_local += timedelta(days=1)
+        return dt_local.astimezone(timezone.utc)
+    return None
 
-            vade_tarih = datetime.strptime(vade_raw.strip(), "%Y-%m-%d %H:%M:%S").date()
-            if vade_tarih == today:
-                aciklama = row[0] if len(row) > 0 else f"Satır {i}"
-                uyarilar.append(f"{aciklama} → Vade tarihi bugün ({vade_raw}) | Ödenmedi")
-        except Exception as e:
-            log.warning(f"Satır {i} hata: {e}")
-            continue
-
-    if uyarilar:
-        msg = "⏰ Bugün vadesi gelen ve ödenmemiş satırlar:\n" + "\n".join(uyarilar)
-        await context.bot.send_message(chat_id=CHAT_ID, text=msg)
+def split_title_time(text: str):
+    if "|" in text:
+        left, right = text.split("|", 1)
+        title = REMIND_RE.sub("", left).strip() or left.strip()
+        when_text = right.strip()
+    else:
+        title = REMIND_RE.sub("", text).strip() or text.strip()
+        when_text = text
+    return title, when_text
 
 # ---------- Handlers ----------
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -203,104 +178,6 @@ async def cmd_not(update: Update, context: ContextTypes.DEFAULT_TYPE):
         log.warning(f"Sheets note error: {e}")
     await update.message.reply_text(f"Not alındı ✅ ({ts_local.strftime('%d.%m.%Y %H:%M')}).")
 
-async def cmd_hatirlat(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Slash command to schedule a reminder."""
-
-    chat_id = update.effective_chat.id
-    text = " ".join(context.args).strip()
-    if not text:
-        return await update.message.reply_text(
-            "Kullanım: /hatirlat su iç | yarın 10:30"
-        )
-
-    title, when_text = split_title_time(f"hatırlat {text}")
-    title = (title or "").strip() or "Hatırlatma"
-
-    when_utc = parse_when(when_text)
-    if not when_utc:
-        return await update.message.reply_text(
-            "Zamanı anlayamadım. Örn: /hatirlat su iç | yarın 10:30"
-        )
-
-    local_str = schedule_reminder(title, when_utc, chat_id, context)
-    await update.message.reply_text(
-        f"Tamam! {local_str} için hatırlatma kuruldu: “{title}”"
-    )
-
-def split_title_time(text: str) -> tuple[str, str]:
-    """Split a reminder message into title and time parts.
-
-    Supports messages like "hatırlat yarın 15:00 su iç" or
-    "hatırlat su iç | yarın 15:00". Returns a tuple of
-    ``(title, when_text)`` where ``when_text`` is the part that
-    describes the reminder time. If no time is found the entire
-    body is returned as ``when_text`` with an empty title.
-    """
-    body = REMIND_RE.sub("", text, count=1).strip()
-    if "|" in body:
-        title, when = [p.strip() for p in body.split("|", 1)]
-        return title, when
-
-    result_all = search_dates(body, languages=["tr"])
-    if result_all:
-        when_text = result_all[-1][0]
-        title = body.replace(when_text, "", 1).strip()
-        return title, when_text
-
-    words = body.split()
-    for i in range(len(words), 0, -1):
-        prefix = " ".join(words[:i])
-        res = search_dates(prefix, languages=["tr"])
-        if res and res[0][0] == prefix:
-            when_text = prefix
-            title = " ".join(words[i:]).strip()
-            return title, when_text
-
-    return "", body
-
-
-def parse_when(text: str) -> datetime | None:
-    """Parse a natural language time expression to UTC ``datetime``.
-
-    The parsing uses :func:`dateparser.search.search_dates` with
-    Turkish language support. A timezone-aware ``datetime`` in UTC
-    is returned. ``None`` is returned if parsing fails.
-    """
-    if not text:
-        return None
-
-    res = search_dates(
-        text,
-        languages=["tr"],
-        settings={"TIMEZONE": TZ_NAME, "RETURN_AS_TIMEZONE_AWARE": True},
-    )
-    if not res:
-        return None
-    dt_local = res[0][1]
-    return dt_local.astimezone(timezone.utc)
-
-def schedule_reminder(title: str, when_utc: datetime, chat_id: int, context: ContextTypes.DEFAULT_TYPE) -> str:
-    """Store a reminder, schedule the job and log it. Returns local time string."""
-
-    con = sqlite3.connect(DB)
-    con.execute(
-        "INSERT INTO reminders(chat_id,title,remind_at_utc,sent) VALUES (?,?,?,0)",
-        (chat_id, title, when_utc.isoformat()),
-    )
-    con.commit(); con.close()
-
-    jobq = context.job_queue or context.application.job_queue
-    jobq.run_once(reminder_job, when=when_utc, data={"chat_id": chat_id, "title": title})
-
-    local_dt = when_utc.astimezone(local_tz)
-    try:
-        gs_append(local_dt, "Hatırlatma (Planlandı)", title, chat_id)
-    except Exception as e:
-        log.warning(f"Sheets reminder plan error: {e}")
-
-    return local_dt.strftime("%d.%m.%Y %H:%M")
-
-
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     txt = (update.message.text or "").strip()
     if not txt:
@@ -316,13 +193,25 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         when_utc = parse_when(when_text)
         if not when_utc:
             return await update.message.reply_text("Zamanı anlayamadım. Örn: “hatırlat su iç | yarın 10:30”.")
-        local_str = schedule_reminder(title, when_utc, chat_id, context)
-        return await update.message.reply_text(
-            f"Tamam! {local_str} için hatırlatma kuruldu: “{title}”"
-        )
+
+        con = sqlite3.connect(DB)
+        con.execute("INSERT INTO reminders(chat_id,title,remind_at_utc,sent) VALUES (?,?,?,0)",
+                    (chat_id, title, when_utc.isoformat()))
+        con.commit(); con.close()
+
+        jobq = context.job_queue or context.application.job_queue
+        jobq.run_once(reminder_job, when=when_utc, data={"chat_id": chat_id, "title": title})
+
+        local_str = when_utc.astimezone(local_tz).strftime("%d.%m.%Y %H:%M")
+        try:
+            gs_append(when_utc.astimezone(local_tz), "Hatırlatma (Planlandı)", title, chat_id)
+        except Exception as e:
+            log.warning(f"Sheets reminder plan error: {e}")
+
+        return await update.message.reply_text(f"Tamam! {local_str} için hatırlatma kuruldu: “{title}”")
 
     # Normal sohbet → OpenAI (GPT-5)
-    reply = await ai_reply(txt)
+    reply = ai_reply(txt)
     await update.message.reply_text(reply or "Üzgünüm, şu an cevap üretemedim.")
 
 async def reminder_job(context: ContextTypes.DEFAULT_TYPE):
@@ -372,21 +261,24 @@ async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
 def main():
     if not BOT_TOKEN:
         raise SystemExit("TELEGRAM_TOKEN eksik (Railway Variables'a ekleyin).")
-        
-    init_db()
-    log.info("Veritabanı başlatıldı")
-
+    db_init()
     app = ApplicationBuilder().token(BOT_TOKEN).build()
-    app.add_handler(CommandHandler("start",    cmd_start))
-    app.add_handler(CommandHandler("not",      cmd_not))
-    app.add_handler(CommandHandler("hatirlat", cmd_hatirlat))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
-    # Vade kontrolü her sabah 09:00
-    app.job_queue.run_daily(
-        vade_kontrol,
-        time=dt_module.time(hour=9, minute=0, tzinfo=local_tz)
-    )
+    # Güvenli JobQueue başlatma (PTB 21.x)
+    jq = app.job_queue
+    if jq is None:
+        jq = JobQueue()
+        jq.set_application(app)
+        jq.start()
+        app.job_queue = jq
+
+    app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("not",   cmd_not))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
+    app.add_error_handler(on_error)
+
+    # periyodik süpürücü (kaçan hatırlatmalar)
+    app.job_queue.run_repeating(sweeper, interval=20, first=10)
 
     app.run_polling(close_loop=False)
 
