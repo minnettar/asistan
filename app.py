@@ -12,7 +12,6 @@ from telegram.ext import (
 
 import gspread
 from google.oauth2.service_account import Credentials
-from openai import OpenAI
 from openai import AsyncOpenAI
 
 # ---------- LOG ----------
@@ -123,7 +122,7 @@ async def ai_reply(prompt: str) -> str:
     if not openai_client:
         return "AI yapılandırılmadı (OPENAI_API_KEY ekleyin)."
     try:
-       resp = await openai_client.chat.completions.create(
+        resp = await openai_client.chat.completions.create(
             model=OPENAI_MODEL,
             messages=[
                 {
@@ -374,7 +373,7 @@ def main():
     if not BOT_TOKEN:
         raise SystemExit("TELEGRAM_TOKEN eksik (Railway Variables'a ekleyin).")
         
-        init_db()
+    init_db()
     log.info("Veritabanı başlatıldı")
 
     app = ApplicationBuilder().token(BOT_TOKEN).build()
