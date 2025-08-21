@@ -3,6 +3,7 @@
 import os, json, base64, logging, pytz, datetime
 from datetime import datetime as dt
 from dateparser.search import search_dates
+
 from telegram import Update
 from telegram.ext import (
     ApplicationBuilder, CommandHandler, MessageHandler,
@@ -142,6 +143,9 @@ async def cmd_not(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         log.warning(f"Sheets note error: {e}")
     await update.message.reply_text(f"Not alındı ✅ ({ts_local.strftime('%d.%m.%Y %H:%M')}).")
+
+
+
 async def _hatirlat_callback(context: ContextTypes.DEFAULT_TYPE):
     job = context.job
     data = job.data or {}
