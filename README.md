@@ -16,8 +16,9 @@ Botun adı **Alina Çelikkalkan**
 ## Komutlar
 
 - `/not <metin>`: not ekler.
-- `/hatirlat <tarih-saat> <mesaj>`: hatırlatma ayarlar (alias `/hatırlat`).
-
+- `/hatirlat <mesaj> | <tarih-saat>`: hatırlatma ayarlar (alias `/hatırlat`).
+  Örnek: `/hatirlat su iç | yarın 15:00`.
+  
 2. Gerekli bağımlılıkları yükleyin:
    ```bash
    pip install -r requirements.txt
