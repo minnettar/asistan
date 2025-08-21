@@ -13,6 +13,7 @@ from telegram.ext import (
 import gspread
 from google.oauth2.service_account import Credentials
 from openai import OpenAI
+from openai import AsyncOpenAI
 
 # ---------- LOG ----------
 logging.basicConfig(
@@ -33,7 +34,7 @@ DB              = Path(__file__).with_name("data.db")
 
 OPENAI_API_KEY  = os.getenv("OPENAI_API_KEY", "").strip()
 OPENAI_MODEL    = os.getenv("OPENAI_MODEL", "gpt-5").strip()
-openai_client   = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
+openai_client   = AsyncOpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
 
 # ---------- DB ----------
 def init_db() -> None:
@@ -83,7 +84,8 @@ def _gs_open(sheet_id: str):
         log.warning(f"Sheets auth error: {e}")
         return None
 
-def gs_append_note(row_date_local: dt, content: str, chat_id: int):
+# Use explicit datetime type for clarity
+def gs_append_note(row_date_local: datetime, content: str, chat_id: int):
     sh = _gs_open(GSHEET_NOTES_ID)
     if not sh:
         return
@@ -117,11 +119,11 @@ def gs_append(dt_local: datetime, entry_type: str, content: str, chat_id: int):
         content
     ])
 # ---------- GPT-5 ----------
-def ai_reply(prompt: str) -> str:
+async def ai_reply(prompt: str) -> str:
     if not openai_client:
         return "AI yapılandırılmadı (OPENAI_API_KEY ekleyin)."
     try:
-        resp = openai_client.chat.completions.create(
+       resp = await openai_client.chat.completions.create(
             model=OPENAI_MODEL,
             messages=[
                 {
@@ -202,6 +204,30 @@ async def cmd_not(update: Update, context: ContextTypes.DEFAULT_TYPE):
         log.warning(f"Sheets note error: {e}")
     await update.message.reply_text(f"Not alındı ✅ ({ts_local.strftime('%d.%m.%Y %H:%M')}).")
 
+async def cmd_hatirlat(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Slash command to schedule a reminder."""
+
+    chat_id = update.effective_chat.id
+    text = " ".join(context.args).strip()
+    if not text:
+        return await update.message.reply_text(
+            "Kullanım: /hatirlat su iç | yarın 10:30"
+        )
+
+    title, when_text = split_title_time(f"hatırlat {text}")
+    title = (title or "").strip() or "Hatırlatma"
+
+    when_utc = parse_when(when_text)
+    if not when_utc:
+        return await update.message.reply_text(
+            "Zamanı anlayamadım. Örn: /hatirlat su iç | yarın 10:30"
+        )
+
+    local_str = schedule_reminder(title, when_utc, chat_id, context)
+    await update.message.reply_text(
+        f"Tamam! {local_str} için hatırlatma kuruldu: “{title}”"
+    )
+
 def split_title_time(text: str) -> tuple[str, str]:
     """Split a reminder message into title and time parts.
 
@@ -252,9 +278,9 @@ def parse_when(text: str) -> datetime | None:
     if not res:
         return None
     dt_local = res[0][1]
-    return dt_local.astimezone(datetime.timezone.utc)
+    return dt_local.astimezone(timezone.utc)
 
-def schedule_reminder(title: str, when_utc: dt, chat_id: int, context: ContextTypes.DEFAULT_TYPE) -> str:
+def schedule_reminder(title: str, when_utc: datetime, chat_id: int, context: ContextTypes.DEFAULT_TYPE) -> str:
     """Store a reminder, schedule the job and log it. Returns local time string."""
 
     con = sqlite3.connect(DB)
@@ -297,7 +323,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
     # Normal sohbet → OpenAI (GPT-5)
-    reply = ai_reply(txt)
+    reply = await ai_reply(txt)
     await update.message.reply_text(reply or "Üzgünüm, şu an cevap üretemedim.")
 
 async def reminder_job(context: ContextTypes.DEFAULT_TYPE):
@@ -349,6 +375,7 @@ def main():
         raise SystemExit("TELEGRAM_TOKEN eksik (Railway Variables'a ekleyin).")
         
         init_db()
+    log.info("Veritabanı başlatıldı")
 
     app = ApplicationBuilder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start",    cmd_start))
