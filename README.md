@@ -7,11 +7,16 @@ Botun adı **Alina Çelikkalkan**
 
 ## 🚀 Kullanım
 
-1. Repo’yu clonela veya indir:
+1. Reponun kopyasını alın:
    ```bash
    git clone <repo-link>
    cd <repo-klasoru>
    ```
+
+## Komutlar
+
+- `/not <metin>`: not ekler.
+- `/hatirlat <tarih-saat> <mesaj>`: hatırlatma ayarlar (alias `/hatırlat`).
 
 2. Gerekli bağımlılıkları yükleyin:
    ```bash
