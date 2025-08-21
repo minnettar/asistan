@@ -130,6 +130,11 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• Normal mesaj yaz → GPT-5 cevap verir (senin dilinde)\n"
         "• Her gün 09:00’da GSHEET_VADE_ID tablosunda D sütununu kontrol ederim.\n"
         "• Eğer O sütununda TRUE ise (ödenmiş), bildirim yapmam."
+        "• hatırlat yarın 15:00 su iç\n"
+        "• hatırlat ilaç al | bugün 21:30\n"
+        "• not al Toplantı özetini hazırla\n"
+        f"Model: {OPENAI_MODEL}"
+    )
     )
 
 async def cmd_not(update: Update, context: ContextTypes.DEFAULT_TYPE):
