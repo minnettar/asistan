@@ -157,7 +157,7 @@ async def cmd_hatirlat(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     raw = " ".join(context.args).strip()
     if not raw:
-        return await update.message.reply_text("Kullanım: /hatirlat <tarih-saat> <mesaj>")
+        return await update.message.reply_text("Kullanım: /hatirlat <tarih-saat> <mesaj> (veya /hatırlat)")
 
     result = search_dates(
         raw,
