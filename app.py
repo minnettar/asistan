@@ -122,19 +122,15 @@ async def vade_kontrol(context: ContextTypes.DEFAULT_TYPE):
         msg = "⏰ Bugün vadesi gelen ve ödenmemiş satırlar:\n" + "\n".join(uyarilar)
         await context.bot.send_message(chat_id=CHAT_ID, text=msg)
 
-# ---------- Telegram Handlers ----------
+# ---------- Handlers ----------
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "Merhaba, ben Alina 🤖\n"
-        "• /not <metin> → not ekler (GSHEET_NOTES_ID içine kaydedilir)\n"
-        "• Normal mesaj yaz → GPT-5 cevap verir (senin dilinde)\n"
-        "• Her gün 09:00’da GSHEET_VADE_ID tablosunda D sütununu kontrol ederim.\n"
-        "• Eğer O sütununda TRUE ise (ödenmiş), bildirim yapmam."
+        "Örnekler:\n"
         "• hatırlat yarın 15:00 su iç\n"
         "• hatırlat ilaç al | bugün 21:30\n"
-        "• not al Toplantı özetini hazırla\n"
+        "• /not Toplantı özetini hazırla\n"
         f"Model: {OPENAI_MODEL}"
-    )
     )
 
 async def cmd_not(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -142,56 +138,96 @@ async def cmd_not(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text    = " ".join(context.args).strip()
     if not text:
         return await update.message.reply_text("Kullanım: /not <metin>")
-    ts_local = dt.now(local_tz)
+    ts_utc = datetime.now(timezone.utc)
+    con = sqlite3.connect(DB)
+    con.execute("INSERT INTO notes(chat_id,text,created_utc) VALUES (?,?,?)",
+                (chat_id, text, ts_utc.isoformat()))
+    con.commit(); con.close()
+    ts_local = ts_utc.astimezone(local_tz)
     try:
-        gs_append_note(ts_local, text, chat_id)
+        gs_append(ts_local, "Not", text, chat_id)
     except Exception as e:
         log.warning(f"Sheets note error: {e}")
     await update.message.reply_text(f"Not alındı ✅ ({ts_local.strftime('%d.%m.%Y %H:%M')}).")
 
-
-
-async def _hatirlat_callback(context: ContextTypes.DEFAULT_TYPE):
-    job = context.job
-    data = job.data or {}
-    chat_id = data.get("chat_id")
-    text = data.get("text", "Hatırlatma zamanı!")
-    await context.bot.send_message(chat_id=chat_id, text=f"🔔 {text}")
-    
-async def cmd_hatirlat(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-    raw = " ".join(context.args).strip()
-    if not raw:
-        return await update.message.reply_text("Kullanım: /hatirlat <tarih-saat> <mesaj> (veya /hatırlat)")
-
-    result = search_dates(
-        raw,
-        settings={"TIMEZONE": TZ_NAME, "RETURN_AS_TIMEZONE_AWARE": True}
-    )
-    if not result:
-        return await update.message.reply_text("Tarih-saat algılanamadı.")
-
-    date_str, when = result[0]
-    if when < dt.now(local_tz):
-        return await update.message.reply_text("Geçmiş bir zaman girdiniz.")
-
-    text = raw.replace(date_str, "").strip() or "Hatırlatma"
-    context.job_queue.run_once(
-        _hatirlat_callback,
-        when,
-        data={"chat_id": chat_id, "text": text}
-    )
-
-    await update.message.reply_text(
-        f"Hatırlatma ayarlandı: {when.astimezone(local_tz).strftime('%d.%m.%Y %H:%M')}"
-    )
-
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     txt = (update.message.text or "").strip()
     if not txt:
-        return
+        return  # boş mesaj gelirse hiçbir şey gönderme
+
+    chat_id = update.effective_chat.id
+
+    # Hatırlatma
+    if REMIND_RE.search(txt):
+        title, when_text = split_title_time(txt)
+        title = (title or "").strip() or "Hatırlatma"
+
+        when_utc = parse_when(when_text)
+        if not when_utc:
+            return await update.message.reply_text("Zamanı anlayamadım. Örn: “hatırlat su iç | yarın 10:30”.")
+
+        con = sqlite3.connect(DB)
+        con.execute("INSERT INTO reminders(chat_id,title,remind_at_utc,sent) VALUES (?,?,?,0)",
+                    (chat_id, title, when_utc.isoformat()))
+        con.commit(); con.close()
+
+        jobq = context.job_queue or context.application.job_queue
+        jobq.run_once(reminder_job, when=when_utc, data={"chat_id": chat_id, "title": title})
+
+        local_str = when_utc.astimezone(local_tz).strftime("%d.%m.%Y %H:%M")
+        try:
+            gs_append(when_utc.astimezone(local_tz), "Hatırlatma (Planlandı)", title, chat_id)
+        except Exception as e:
+            log.warning(f"Sheets reminder plan error: {e}")
+
+        return await update.message.reply_text(f"Tamam! {local_str} için hatırlatma kuruldu: “{title}”")
+
+    # Normal sohbet → OpenAI (GPT-5)
     reply = ai_reply(txt)
-    await update.message.reply_text(reply)
+    await update.message.reply_text(reply or "Üzgünüm, şu an cevap üretemedim.")
+
+async def reminder_job(context: ContextTypes.DEFAULT_TYPE):
+    d = context.job.data or {}
+    chat_id = int(d.get("chat_id"))
+    title   = (d.get("title") or "").strip() or "Hatırlatma"
+
+    await context.bot.send_message(chat_id=chat_id, text=f"⏰ Hatırlatma: {title}")
+
+    con = sqlite3.connect(DB)
+    con.execute(
+        "UPDATE reminders SET sent=1 WHERE rowid = (SELECT rowid FROM reminders WHERE chat_id=? AND title=? ORDER BY rowid DESC LIMIT 1)",
+        (chat_id, title)
+    )
+    con.commit(); con.close()
+    try:
+        gs_append(datetime.now(local_tz), "Hatırlatma (Gönderildi)", title, chat_id)
+    except Exception as e:
+        log.warning(f"Sheets reminder send error: {e}")
+
+async def sweeper(context: ContextTypes.DEFAULT_TYPE):
+    """Kaçan hatırlatmaları yakala (worker yeniden başlarsa)."""
+    now_iso = datetime.now(timezone.utc).isoformat()
+    con = sqlite3.connect(DB)
+    rows = con.execute(
+        "SELECT id, chat_id, title, remind_at_utc FROM reminders WHERE sent=0 AND remind_at_utc<=?",
+        (now_iso,)
+    ).fetchall()
+    for _id, chat_id, title, ts in rows:
+        await context.bot.send_message(chat_id=chat_id, text=f"⏰ (Geç) Hatırlatma: {title}")
+        con.execute("UPDATE reminders SET sent=1 WHERE id=?", (_id,))
+        try:
+            gs_append(datetime.now(local_tz), "Hatırlatma (Geç yakalandı)", title, chat_id)
+        except Exception as e:
+            log.warning(f"Sheets late log error: {e}")
+    con.commit(); con.close()
+
+# (opsiyonel) basit error handler
+async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    from telegram.error import Conflict
+    if isinstance(context.error, Conflict):
+        log.warning("Another polling instance detected; ignoring Conflict.")
+        return
+    log.exception(context.error)
 
 # ---------- MAIN ----------
 def main():
