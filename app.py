@@ -2,7 +2,7 @@
 
 import os, json, base64, logging, pytz, datetime
 from datetime import datetime as dt
-
+from dateparser.search import search_dates
 from telegram import Update
 from telegram.ext import (
     ApplicationBuilder, CommandHandler, MessageHandler,
@@ -142,6 +142,40 @@ async def cmd_not(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         log.warning(f"Sheets note error: {e}")
     await update.message.reply_text(f"Not alındı ✅ ({ts_local.strftime('%d.%m.%Y %H:%M')}).")
+async def _hatirlat_callback(context: ContextTypes.DEFAULT_TYPE):
+    job = context.job
+    data = job.data or {}
+    chat_id = data.get("chat_id")
+    text = data.get("text", "Hatırlatma zamanı!")
+    await context.bot.send_message(chat_id=chat_id, text=f"🔔 {text}")
+    
+async def cmd_hatirlat(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    raw = " ".join(context.args).strip()
+    if not raw:
+        return await update.message.reply_text("Kullanım: /hatirlat <tarih-saat> <mesaj>")
+
+    result = search_dates(
+        raw,
+        settings={"TIMEZONE": TZ_NAME, "RETURN_AS_TIMEZONE_AWARE": True}
+    )
+    if not result:
+        return await update.message.reply_text("Tarih-saat algılanamadı.")
+
+    date_str, when = result[0]
+    if when < dt.now(local_tz):
+        return await update.message.reply_text("Geçmiş bir zaman girdiniz.")
+
+    text = raw.replace(date_str, "").strip() or "Hatırlatma"
+    context.job_queue.run_once(
+        _hatirlat_callback,
+        when,
+        data={"chat_id": chat_id, "text": text}
+    )
+
+    await update.message.reply_text(
+        f"Hatırlatma ayarlandı: {when.astimezone(local_tz).strftime('%d.%m.%Y %H:%M')}"
+    )
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     txt = (update.message.text or "").strip()
@@ -156,8 +190,9 @@ def main():
         raise SystemExit("TELEGRAM_TOKEN eksik (Railway Variables'a ekleyin).")
 
     app = ApplicationBuilder().token(BOT_TOKEN).build()
-    app.add_handler(CommandHandler("start", cmd_start))
-    app.add_handler(CommandHandler("not",   cmd_not))
+    app.add_handler(CommandHandler("start",    cmd_start))
+    app.add_handler(CommandHandler("not",      cmd_not))
+    app.add_handler(CommandHandler("hatirlat", cmd_hatirlat))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
     # Vade kontrolü her sabah 09:00
