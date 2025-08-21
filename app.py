@@ -1,6 +1,8 @@
 # app.py — Alina Bot | GPT-5 + Notlar + Vade Kontrol
-
-import os, json, base64, logging, pytz, datetime
+import os, json, base64, logging, pytz, datetime, re
+import os, json, base64, logging, pytz, datetime, sqlite3
+from datetime import datetime as dt, timezone
+from pathlib import Path
 from datetime import datetime as dt
 from dateparser.search import search_dates
 
@@ -29,9 +31,14 @@ CHAT_ID         = int(os.getenv("CHAT_ID", "8396073279"))
 TZ_NAME         = os.getenv("TZ", "Europe/Istanbul")
 local_tz        = pytz.timezone(TZ_NAME)
 
+DB              = Path(__file__).with_name("data.db")
+
 OPENAI_API_KEY  = os.getenv("OPENAI_API_KEY", "").strip()
 OPENAI_MODEL    = os.getenv("OPENAI_MODEL", "gpt-5").strip()
 openai_client   = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
+
+# Regex to detect reminder commands like "hatırlat" or "/hatirlat"
+REMIND_RE = re.compile(r"^\s*(?:/)?hat[ıi]rlat\b", re.IGNORECASE)
 
 # ---------- Google Sheets ----------
 def _gs_open(sheet_id: str):
@@ -63,7 +70,23 @@ def gs_append_note(row_date_local: dt, content: str, chat_id: int):
         str(chat_id),
         content
     ])
-
+def gs_append(dt_local: dt, entry_type: str, content: str, chat_id: int):
+    sh = _gs_open(GSHEET_NOTES_ID)
+    if not sh:
+        return
+    tab = dt_local.strftime("%Y-%m-%d")
+    try:
+        ws = sh.worksheet(tab)
+    except gspread.WorksheetNotFound:
+        ws = sh.add_worksheet(title=tab, rows=1000, cols=6)
+        ws.append_row(["Tarih","Saat","Tür","ChatID","İçerik"])
+    ws.append_row([
+        dt_local.strftime("%d.%m.%Y"),
+        dt_local.strftime("%H:%M:%S"),
+        entry_type,
+        str(chat_id),
+        content
+    ])
 # ---------- GPT-5 ----------
 def ai_reply(prompt: str) -> str:
     if not openai_client:
@@ -150,6 +173,142 @@ async def cmd_not(update: Update, context: ContextTypes.DEFAULT_TYPE):
         log.warning(f"Sheets note error: {e}")
     await update.message.reply_text(f"Not alındı ✅ ({ts_local.strftime('%d.%m.%Y %H:%M')}).")
 
+async def cmd_hatirlat(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Schedule a reminder.
+
+    Usage: /hatirlat <başlık> | <zaman>
+    """
+
+    chat_id = update.effective_chat.id
+    args    = " ".join(context.args).strip()
+    if not args:
+        return await update.message.reply_text(
+            "Kullanım: /hatirlat <metin | zaman>"
+        )
+
+    title, when_text = split_title_time(args)
+    title = (title or "").strip() or "Hatırlatma"
+
+    when_utc = parse_when(when_text)
+    if not when_utc:
+        return await update.message.reply_text(
+            "Zamanı anlayamadım. Örn: /hatirlat su iç | yarın 10:30."
+        )
+
+    con = sqlite3.connect(DB)
+    con.execute(
+        "INSERT INTO reminders(chat_id,title,remind_at_utc,sent) VALUES (?,?,?,0)",
+        (chat_id, title, when_utc.isoformat()),
+    )
+    con.commit(); con.close()
+
+    jobq = context.job_queue or context.application.job_queue
+    jobq.run_once(reminder_job, when=when_utc, data={"chat_id": chat_id, "title": title})
+
+    local_str = when_utc.astimezone(local_tz).strftime("%d.%m.%Y %H:%M")
+    try:
+        gs_append(when_utc.astimezone(local_tz), "Hatırlatma (Planlandı)", title, chat_id)
+    except Exception as e:
+        log.warning(f"Sheets reminder plan error: {e}")
+
+    await update.message.reply_text(
+        f"Tamam! {local_str} için hatırlatma kuruldu: “{title}”"
+    )
+
+
+async def cmd_hatirlat(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Schedule a reminder.
+
+    Usage: /hatirlat <başlık> | <zaman>
+    """
+
+    chat_id = update.effective_chat.id
+    args    = " ".join(context.args).strip()
+    if not args:
+        return await update.message.reply_text(
+            "Kullanım: /hatirlat <metin | zaman>"
+        )
+
+    title, when_text = split_title_time(args)
+    title = (title or "").strip() or "Hatırlatma"
+
+    when_utc = parse_when(when_text)
+    if not when_utc:
+        return await update.message.reply_text(
+            "Zamanı anlayamadım. Örn: /hatirlat su iç | yarın 10:30."
+        )
+
+    con = sqlite3.connect(DB)
+    con.execute(
+        "INSERT INTO reminders(chat_id,title,remind_at_utc,sent) VALUES (?,?,?,0)",
+        (chat_id, title, when_utc.isoformat()),
+    )
+    con.commit(); con.close()
+
+    jobq = context.job_queue or context.application.job_queue
+    jobq.run_once(reminder_job, when=when_utc, data={"chat_id": chat_id, "title": title})
+
+    local_str = when_utc.astimezone(local_tz).strftime("%d.%m.%Y %H:%M")
+    try:
+        gs_append(when_utc.astimezone(local_tz), "Hatırlatma (Planlandı)", title, chat_id)
+    except Exception as e:
+        log.warning(f"Sheets reminder plan error: {e}")
+
+    await update.message.reply_text(
+        f"Tamam! {local_str} için hatırlatma kuruldu: “{title}”"
+    )
+def split_title_time(text: str) -> tuple[str, str]:
+    """Split a reminder message into title and time parts.
+
+    Supports messages like "hatırlat yarın 15:00 su iç" or
+    "hatırlat su iç | yarın 15:00". Returns a tuple of
+    ``(title, when_text)`` where ``when_text`` is the part that
+    describes the reminder time. If no time is found the entire
+    body is returned as ``when_text`` with an empty title.
+    """
+    body = REMIND_RE.sub("", text, count=1).strip()
+    if "|" in body:
+        title, when = [p.strip() for p in body.split("|", 1)]
+        return title, when
+
+    result_all = search_dates(body, languages=["tr"])
+    if result_all:
+        when_text = result_all[-1][0]
+        title = body.replace(when_text, "", 1).strip()
+        return title, when_text
+
+    words = body.split()
+    for i in range(len(words), 0, -1):
+        prefix = " ".join(words[:i])
+        res = search_dates(prefix, languages=["tr"])
+        if res and res[0][0] == prefix:
+            when_text = prefix
+            title = " ".join(words[i:]).strip()
+            return title, when_text
+
+    return "", body
+
+
+def parse_when(text: str) -> dt | None:
+    """Parse a natural language time expression to UTC ``datetime``.
+
+    The parsing uses :func:`dateparser.search.search_dates` with
+    Turkish language support. A timezone-aware ``datetime`` in UTC
+    is returned. ``None`` is returned if parsing fails.
+    """
+    if not text:
+        return None
+
+    res = search_dates(
+        text,
+        languages=["tr"],
+        settings={"TIMEZONE": TZ_NAME, "RETURN_AS_TIMEZONE_AWARE": True},
+    )
+    if not res:
+        return None
+    dt_local = res[0][1]
+    return dt_local.astimezone(datetime.timezone.utc)
+
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     txt = (update.message.text or "").strip()
     if not txt:
@@ -200,13 +359,13 @@ async def reminder_job(context: ContextTypes.DEFAULT_TYPE):
     )
     con.commit(); con.close()
     try:
-        gs_append(datetime.now(local_tz), "Hatırlatma (Gönderildi)", title, chat_id)
+        gs_append(dt.now(local_tz), "Hatırlatma (Gönderildi)", title, chat_id)
     except Exception as e:
         log.warning(f"Sheets reminder send error: {e}")
 
 async def sweeper(context: ContextTypes.DEFAULT_TYPE):
     """Kaçan hatırlatmaları yakala (worker yeniden başlarsa)."""
-    now_iso = datetime.now(timezone.utc).isoformat()
+    now_iso = dt.now(timezone.utc).isoformat()
     con = sqlite3.connect(DB)
     rows = con.execute(
         "SELECT id, chat_id, title, remind_at_utc FROM reminders WHERE sent=0 AND remind_at_utc<=?",
@@ -216,7 +375,7 @@ async def sweeper(context: ContextTypes.DEFAULT_TYPE):
         await context.bot.send_message(chat_id=chat_id, text=f"⏰ (Geç) Hatırlatma: {title}")
         con.execute("UPDATE reminders SET sent=1 WHERE id=?", (_id,))
         try:
-            gs_append(datetime.now(local_tz), "Hatırlatma (Geç yakalandı)", title, chat_id)
+            gs_append(dt.now(local_tz), "Hatırlatma (Geç yakalandı)", title, chat_id)
         except Exception as e:
             log.warning(f"Sheets late log error: {e}")
     con.commit(); con.close()
@@ -228,6 +387,38 @@ async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
         log.warning("Another polling instance detected; ignoring Conflict.")
         return
     log.exception(context.error)
+
+import unittest
+import datetime
+from app import REMIND_RE, split_title_time, parse_when
+
+
+class UtilsTests(unittest.TestCase):
+    def test_remind_regex(self):
+        self.assertTrue(REMIND_RE.search("hatirlat test"))
+        self.assertTrue(REMIND_RE.search("hatırlat test"))
+        self.assertTrue(REMIND_RE.search("/hatirlat test"))
+        self.assertFalse(REMIND_RE.search("no match"))
+
+    def test_split_title_time_with_pipe(self):
+        title, when = split_title_time("hatırlat su iç | yarın 15:00")
+        self.assertEqual(title, "su iç")
+        self.assertEqual(when, "yarın 15:00")
+
+    def test_split_title_time_freeform(self):
+        title, when = split_title_time("hatırlat yarın 15:00 su iç")
+        self.assertEqual(title, "su iç")
+        self.assertEqual(when, "yarın 15:00")
+
+    def test_parse_when(self):
+        dt_utc = parse_when("1 Ocak 2099 12:00")
+        self.assertIsNotNone(dt_utc)
+        self.assertEqual(dt_utc.tzinfo, datetime.timezone.utc)
+        self.assertEqual((dt_utc.year, dt_utc.month, dt_utc.day), (2099, 1, 1))
+
+
+if __name__ == "__main__":
+    unittest.main()
 
 # ---------- MAIN ----------
 def main():
