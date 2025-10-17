@@ -2,7 +2,19 @@ import streamlit as st
 import pandas as pd
 from pydrive2.auth import GoogleAuth
 from pydrive2.drive import GoogleDrive
-import datetime, io, os
+import streamlit as st
+import tempfile, json, os
+
+@st.cache_resource
+def get_drive():
+    secrets = st.secrets["gdrive"]
+    creds_file = tempfile.NamedTemporaryFile(delete=False)
+    json.dump(dict(secrets), open(creds_file.name, "w"))
+    gauth = GoogleAuth()
+    gauth.LoadCredentialsFile(creds_file.name)
+    gauth.ServiceAuth()
+    return GoogleDrive(gauth)
+
 
 st.set_page_config(page_title="ŞEKEROĞLU Tahsilat Planı", layout="wide")
 
