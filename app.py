@@ -1,6 +1,5 @@
 import streamlit as st
 import pandas as pd
-from pydrive2.auth import GoogleAuth
 from pydrive2.drive import GoogleDrive
 import streamlit as st
 import tempfile, json, os
