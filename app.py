@@ -1,19 +1,8 @@
+# app.py — Şekeroğlu Tahsilat Planı (Cloud Uyumlu Sürüm)
 import streamlit as st
 import pandas as pd
-from pydrive2.drive import GoogleDrive
-import streamlit as st
-import tempfile, json, os
-
-@st.cache_resource
-def get_drive():
-    secrets = st.secrets["gdrive"]
-    creds_file = tempfile.NamedTemporaryFile(delete=False)
-    json.dump(dict(secrets), open(creds_file.name, "w"))
-    gauth = GoogleAuth()
-    gauth.LoadCredentialsFile(creds_file.name)
-    gauth.ServiceAuth()
-    return GoogleDrive(gauth)
-
+import numpy as np
+import io, datetime
 
 st.set_page_config(page_title="ŞEKEROĞLU Tahsilat Planı", layout="wide")
 
@@ -49,35 +38,32 @@ if st.sidebar.button("Çıkış Yap"):
     st.session_state.user = None
     st.rerun()
 
-# === Google Drive bağlantısı ===
-EXCEL_FILE_ID = "1C8OpNAIRySkWYTI9jBaboV-Rq85UbVD9"  # Orijinal CRM'deki dosya ID
+# === Google Drive Excel bağlantısı (kimlik gerekmez) ===
+# 👇 Buraya kendi dosya ID’nizi yazabilirsiniz (Drive'da Paylaş → "Bağlantıya sahip herkes görüntüleyebilir")
+EXCEL_FILE_ID = "1C8OpNAIRySkWYTI9jBaboV-Rq85UbVD9"
+EXCEL_URL = f"https://drive.google.com/uc?export=download&id={EXCEL_FILE_ID}"
 
-@st.cache_resource
-def get_drive():
-    gauth = GoogleAuth()
-    gauth.LocalWebserverAuth()
-    return GoogleDrive(gauth)
+@st.cache_data(ttl=600)
+def load_data():
+    try:
+        # Müşteri ve Evrak sayfalarını oku
+        xls = pd.ExcelFile(EXCEL_URL, engine="openpyxl")
+        df_musteri = pd.read_excel(xls, sheet_name=0)
+        df_evrak = pd.read_excel(xls, sheet_name="Evraklar")
+        return df_musteri, df_evrak
+    except Exception as e:
+        st.error(f"Veri yüklenemedi: {e}")
+        return pd.DataFrame(), pd.DataFrame()
 
-drive = get_drive()
+df_musteri, df_evrak = load_data()
 
-def load_excel_from_drive(file_id: str):
-    downloaded = drive.CreateFile({'id': file_id})
-    downloaded.GetContentFile("temp_tahsilat.xlsx")
-    df_musteri = pd.read_excel("temp_tahsilat.xlsx", sheet_name=0)
-    df_evrak = pd.read_excel("temp_tahsilat.xlsx", sheet_name="Evraklar")
-    return df_musteri, df_evrak
-
-try:
-    df_musteri, df_evrak = load_excel_from_drive(EXCEL_FILE_ID)
-except Exception as e:
-    st.error(f"Google Drive'dan veri alınamadı: {e}")
+if df_musteri.empty or df_evrak.empty:
     st.stop()
 
-# === Filtreleme ===
+# === Kullanıcı bazlı filtreleme ===
 aktif_kullanici = st.session_state.user
 
 if aktif_kullanici.lower() != "admin":
-    # Kullanıcının müşterilerini bul
     kendi_musterileri = df_musteri.loc[
         df_musteri["Satış Temsilcisi"].astype(str).str.lower() == aktif_kullanici.lower(),
         "Müşteri Adı"
@@ -91,43 +77,42 @@ if aktif_kullanici.lower() != "admin":
 else:
     df_tahsilat = df_evrak.copy()
 
-# === Görünüm ===
+# === Arayüz ===
 st.title("💰 ŞEKEROĞLU Tahsilat Planı")
 st.markdown("Bu sayfada sadece size bağlı müşterilerin vadeli fatura bilgilerini görüntülüyorsunuz.")
 
 if df_tahsilat.empty:
     st.info("Görüntülenecek tahsilat kaydı bulunamadı.")
 else:
-    # Sayısal kolonları dönüştür
-    if "Tutar" in df_tahsilat.columns:
-        df_tahsilat["Tutar"] = pd.to_numeric(df_tahsilat["Tutar"], errors="coerce").fillna(0.0)
-    if "Ödenen Tutar" in df_tahsilat.columns:
-        df_tahsilat["Ödenen Tutar"] = pd.to_numeric(df_tahsilat["Ödenen Tutar"], errors="coerce").fillna(0.0)
+    # Sayısal işlemler
+    for col in ["Tutar", "Ödenen Tutar"]:
+        if col in df_tahsilat.columns:
+            df_tahsilat[col] = pd.to_numeric(df_tahsilat[col], errors="coerce").fillna(0.0)
+    df_tahsilat["Kalan Tutar"] = (df_tahsilat.get("Tutar", 0) - df_tahsilat.get("Ödenen Tutar", 0)).clip(lower=0.0)
 
-    # Kalan tutar
-    df_tahsilat["Kalan Tutar"] = (df_tahsilat["Tutar"] - df_tahsilat["Ödenen Tutar"]).clip(lower=0.0)
-
-    # Tarih formatı
+    # Tarihler
     if "Vade Tarihi" in df_tahsilat.columns:
-        df_tahsilat["Vade Tarihi"] = pd.to_datetime(df_tahsilat["Vade Tarihi"], errors="coerce").dt.strftime("%d/%m/%Y")
+        df_tahsilat["Vade Tarihi"] = pd.to_datetime(df_tahsilat["Vade Tarihi"], errors="coerce")
+        df_tahsilat["Kalan Gün"] = (df_tahsilat["Vade Tarihi"] - pd.Timestamp.today()).dt.days
+        df_tahsilat["Vade Tarihi"] = df_tahsilat["Vade Tarihi"].dt.strftime("%d/%m/%Y").fillna("")
 
+    # Görünüm
     st.dataframe(
-        df_tahsilat[[
-            "Müşteri Adı",
-            "Fatura No",
-            "Vade Tarihi",
-            "Tutar",
-            "Ödenen Tutar",
-            "Kalan Tutar",
-            "Satış Temsilcisi"
-        ]],
+        df_tahsilat[
+            ["Müşteri Adı", "Fatura No", "Vade Tarihi", "Kalan Gün", "Tutar", "Ödenen Tutar", "Kalan Tutar", "Satış Temsilcisi"]
+        ],
         use_container_width=True
     )
 
-    toplam_tahsilat = df_tahsilat["Kalan Tutar"].sum()
-    st.metric("Toplam Bekleyen Tahsilat", f"{toplam_tahsilat:,.2f} USD")
+    # Toplam metrik
+    toplam_bekleyen = df_tahsilat["Kalan Tutar"].sum()
+    geciken = df_tahsilat[df_tahsilat["Kalan Gün"] < 0]["Kalan Tutar"].sum()
+    vadesi_gelmemis = df_tahsilat[df_tahsilat["Kalan Gün"] >= 0]["Kalan Tutar"].sum()
 
-# === Alt bilgi ===
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Toplam Bekleyen Tahsilat", f"{toplam_bekleyen:,.2f} USD")
+    c2.metric("Geciken Tahsilatlar", f"{geciken:,.2f} USD")
+    c3.metric("Vadeleri Gelmemiş", f"{vadesi_gelmemis:,.2f} USD")
+
 st.markdown("---")
-st.caption("© 2025 ŞEKEROĞLU GROUP | Streamlit CRM Tahsilat Görünümü")
-
+st.caption("© 2025 ŞEKEROĞLU GROUP | Streamlit Cloud CRM – Tahsilat Görünümü")
